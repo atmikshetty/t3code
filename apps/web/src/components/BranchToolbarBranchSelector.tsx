@@ -1,7 +1,7 @@
 import type { GitBranch } from "@t3tools/contracts";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ChevronDownIcon } from "lucide-react";
+import { ChevronDownIcon, PlusIcon } from "lucide-react";
 import {
   type CSSProperties,
   useCallback,
@@ -36,6 +36,15 @@ import {
   ComboboxStatus,
   ComboboxTrigger,
 } from "./ui/combobox";
+import {
+  Dialog,
+  DialogFooter,
+  DialogHeader,
+  DialogPanel,
+  DialogPopup,
+  DialogTitle,
+} from "./ui/dialog";
+import { Input } from "./ui/input";
 import { toastManager } from "./ui/toast";
 
 interface BranchToolbarBranchSelectorProps {
@@ -82,11 +91,14 @@ export function BranchToolbarBranchSelector({
 }: BranchToolbarBranchSelectorProps) {
   const queryClient = useQueryClient();
   const [isBranchMenuOpen, setIsBranchMenuOpen] = useState(false);
+  const [isCreateBranchDialogOpen, setIsCreateBranchDialogOpen] = useState(false);
   const [branchQuery, setBranchQuery] = useState("");
+  const [createBranchName, setCreateBranchName] = useState("");
   const deferredBranchQuery = useDeferredValue(branchQuery);
 
   const branchStatusQuery = useGitStatus(branchCwd);
   const trimmedBranchQuery = branchQuery.trim();
+  const trimmedCreateBranchName = createBranchName.trim();
   const deferredTrimmedBranchQuery = deferredBranchQuery.trim();
 
   useEffect(() => {
@@ -131,21 +143,14 @@ export function BranchToolbarBranchSelector({
     effectiveEnvMode === "worktree" && !envLocked && !activeWorktreePath;
   const checkoutPullRequestItemValue =
     prReference && onCheckoutPullRequestRequest ? `__checkout_pull_request__:${prReference}` : null;
-  const canCreateBranch = !isSelectingWorktreeBase && trimmedBranchQuery.length > 0;
-  const hasExactBranchMatch = branchByName.has(trimmedBranchQuery);
-  const createBranchItemValue = canCreateBranch
-    ? `__create_new_branch__:${trimmedBranchQuery}`
-    : null;
+  const canRenderCreateBranchAction = !isSelectingWorktreeBase;
   const branchPickerItems = useMemo(() => {
     const items = [...branchNames];
-    if (createBranchItemValue && !hasExactBranchMatch) {
-      items.push(createBranchItemValue);
-    }
     if (checkoutPullRequestItemValue) {
       items.unshift(checkoutPullRequestItemValue);
     }
     return items;
-  }, [branchNames, checkoutPullRequestItemValue, createBranchItemValue, hasExactBranchMatch]);
+  }, [branchNames, checkoutPullRequestItemValue]);
   const filteredBranchPickerItems = useMemo(
     () =>
       normalizedDeferredBranchQuery.length === 0
@@ -154,16 +159,11 @@ export function BranchToolbarBranchSelector({
             shouldIncludeBranchPickerItem({
               itemValue,
               normalizedQuery: normalizedDeferredBranchQuery,
-              createBranchItemValue,
+              createBranchItemValue: null,
               checkoutPullRequestItemValue,
             }),
           ),
-    [
-      branchPickerItems,
-      checkoutPullRequestItemValue,
-      createBranchItemValue,
-      normalizedDeferredBranchQuery,
-    ],
+    [branchPickerItems, checkoutPullRequestItemValue, normalizedDeferredBranchQuery],
   );
   const [resolvedActiveBranch, setOptimisticBranch] = useOptimistic(
     canonicalActiveBranch,
@@ -251,6 +251,8 @@ export function BranchToolbarBranchSelector({
     const api = readNativeApi();
     if (!api || !branchCwd || !name || isBranchActionPending) return;
 
+    setIsCreateBranchDialogOpen(false);
+    setCreateBranchName("");
     setIsBranchMenuOpen(false);
     onComposerFocusRequest?.();
 
@@ -274,6 +276,25 @@ export function BranchToolbarBranchSelector({
         });
       }
     });
+  };
+
+  const openCreateBranchDialog = () => {
+    if (isSelectingWorktreeBase || isBranchActionPending) {
+      return;
+    }
+
+    setIsBranchMenuOpen(false);
+    setBranchQuery("");
+    setCreateBranchName("");
+    setIsCreateBranchDialogOpen(true);
+  };
+
+  const submitCreateBranchDialog = () => {
+    if (trimmedCreateBranchName.length === 0 || isBranchActionPending) {
+      return;
+    }
+
+    createBranch(trimmedCreateBranchName);
   };
 
   useEffect(() => {
@@ -424,21 +445,6 @@ export function BranchToolbarBranchSelector({
         </ComboboxItem>
       );
     }
-    if (createBranchItemValue && itemValue === createBranchItemValue) {
-      return (
-        <ComboboxItem
-          hideIndicator
-          key={itemValue}
-          index={index}
-          value={itemValue}
-          style={style}
-          onClick={() => createBranch(trimmedBranchQuery)}
-        >
-          <span className="truncate">Create new branch "{trimmedBranchQuery}"</span>
-        </ComboboxItem>
-      );
-    }
-
     const branch = branchByName.get(itemValue);
     if (!branch) return null;
 
@@ -530,7 +536,73 @@ export function BranchToolbarBranchSelector({
           )}
         </ComboboxList>
         {branchStatusText ? <ComboboxStatus>{branchStatusText}</ComboboxStatus> : null}
+        {canRenderCreateBranchAction ? (
+          <div className="border-t p-1">
+            <button
+              type="button"
+              className="flex w-full items-center gap-2 rounded-sm px-2 py-1 text-sm transition-colors hover:bg-accent disabled:pointer-events-none disabled:opacity-64"
+              onClick={openCreateBranchDialog}
+              disabled={isBranchActionPending}
+            >
+              <PlusIcon className="size-4 shrink-0" />
+              <span className="truncate">Create and checkout new branch...</span>
+            </button>
+          </div>
+        ) : null}
       </ComboboxPopup>
+      <Dialog
+        open={isCreateBranchDialogOpen}
+        onOpenChange={(open) => {
+          setIsCreateBranchDialogOpen(open);
+          if (!open) {
+            setCreateBranchName("");
+          }
+        }}
+      >
+        <DialogPopup bottomStickOnMobile={false} className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Create and checkout branch</DialogTitle>
+          </DialogHeader>
+          <DialogPanel className="space-y-3">
+            <div className="space-y-2">
+              <label className="font-medium text-sm" htmlFor="create-branch-name">
+                Branch name
+              </label>
+              <form
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  submitCreateBranchDialog();
+                }}
+              >
+                <Input
+                  id="create-branch-name"
+                  autoFocus
+                  placeholder="feature/my-branch"
+                  value={createBranchName}
+                  onChange={(event) => setCreateBranchName(event.target.value)}
+                />
+              </form>
+            </div>
+          </DialogPanel>
+          <DialogFooter variant="bare">
+            <Button
+              variant="outline"
+              onClick={() => {
+                setIsCreateBranchDialogOpen(false);
+                setCreateBranchName("");
+              }}
+            >
+              Close
+            </Button>
+            <Button
+              onClick={submitCreateBranchDialog}
+              disabled={trimmedCreateBranchName.length === 0 || isBranchActionPending}
+            >
+              Create and checkout
+            </Button>
+          </DialogFooter>
+        </DialogPopup>
+      </Dialog>
     </Combobox>
   );
 }
