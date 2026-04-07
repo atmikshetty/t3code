@@ -559,7 +559,11 @@ export function BranchToolbarBranchSelector({
           }
         }}
       >
-        <DialogPopup bottomStickOnMobile={false} className="max-w-md">
+        <DialogPopup
+          bottomStickOnMobile={false}
+          className="max-w-md"
+          viewportClassName="grid-rows-[1fr_auto_1fr]"
+        >
           <DialogHeader>
             <DialogTitle>Create and checkout branch</DialogTitle>
           </DialogHeader>

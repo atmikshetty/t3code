@@ -37,7 +37,7 @@ function DialogViewport({ className, ...props }: DialogPrimitive.Viewport.Props)
   return (
     <DialogPrimitive.Viewport
       className={cn(
-        "fixed inset-0 z-50 grid grid-rows-[1fr_auto_1fr] justify-items-center p-4",
+        "fixed inset-0 z-50 grid grid-rows-[1fr_auto_3fr] justify-items-center p-4",
         className,
       )}
       data-slot="dialog-viewport"
@@ -51,16 +51,21 @@ function DialogPopup({
   children,
   showCloseButton = true,
   bottomStickOnMobile = true,
+  viewportClassName,
   ...props
 }: DialogPrimitive.Popup.Props & {
   showCloseButton?: boolean;
   bottomStickOnMobile?: boolean;
+  viewportClassName?: string;
 }) {
   return (
     <DialogPortal>
       <DialogBackdrop />
       <DialogViewport
-        className={cn(bottomStickOnMobile && "max-sm:grid-rows-[1fr_auto] max-sm:p-0 max-sm:pt-12")}
+        className={cn(
+          bottomStickOnMobile && "max-sm:grid-rows-[1fr_auto] max-sm:p-0 max-sm:pt-12",
+          viewportClassName,
+        )}
       >
         <DialogPrimitive.Popup
           className={cn(
