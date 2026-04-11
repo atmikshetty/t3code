@@ -285,6 +285,7 @@ function TerminalViewport({
   const selectionActionTimerRef = useRef<number | null>(null);
   const lastAppliedTerminalEventIdRef = useRef(0);
   const terminalHydratedRef = useRef(false);
+  const lastSyncedTerminalSizeRef = useRef<{ cols: number; rows: number } | null>(null);
   const handleSessionExited = useEffectEvent(() => {
     onSessionExited();
   });
@@ -632,13 +633,16 @@ function TerminalViewport({
         const activeFitAddon = fitAddonRef.current;
         if (!activeTerminal || !activeFitAddon) return;
         activeFitAddon.fit();
+        const cols = activeTerminal.cols;
+        const rows = activeTerminal.rows;
+        lastSyncedTerminalSizeRef.current = { cols, rows };
         const snapshot = await api.terminal.open({
           threadId,
           terminalId,
           cwd,
           ...(worktreePath !== undefined ? { worktreePath } : {}),
-          cols: activeTerminal.cols,
-          rows: activeTerminal.rows,
+          cols,
+          rows,
           ...(runtimeEnv ? { env: runtimeEnv } : {}),
         });
         if (disposed) return;
@@ -677,6 +681,7 @@ function TerminalViewport({
       disposed = true;
       terminalHydratedRef.current = false;
       lastAppliedTerminalEventIdRef.current = 0;
+      lastSyncedTerminalSizeRef.current = null;
       unsubscribeTerminalEvents();
       inputDisposable.dispose();
       selectionDisposable.dispose();
@@ -712,19 +717,26 @@ function TerminalViewport({
     const api = readNativeApi();
     const terminal = terminalRef.current;
     const fitAddon = fitAddonRef.current;
-    if (!api || !terminal || !fitAddon) return;
+    if (!api || !terminal || !fitAddon || !terminalHydratedRef.current) return;
     const wasAtBottom = terminal.buffer.active.viewportY >= terminal.buffer.active.baseY;
     const frame = window.requestAnimationFrame(() => {
       fitAddon.fit();
       if (wasAtBottom) {
         terminal.scrollToBottom();
       }
+      const cols = terminal.cols;
+      const rows = terminal.rows;
+      const lastSyncedSize = lastSyncedTerminalSizeRef.current;
+      if (lastSyncedSize && lastSyncedSize.cols === cols && lastSyncedSize.rows === rows) {
+        return;
+      }
+      lastSyncedTerminalSizeRef.current = { cols, rows };
       void api.terminal
         .resize({
           threadId,
           terminalId,
-          cols: terminal.cols,
-          rows: terminal.rows,
+          cols,
+          rows,
         })
         .catch(() => undefined);
     });
@@ -1085,19 +1097,24 @@ export default function ThreadTerminalDrawer({
     }
 
     const onWindowResize = () => {
-      const clampedHeight = clampDrawerHeight(drawerHeightRef.current);
-      const clampedWidth = clampTerminalDockWidth(drawerWidthRef.current);
-      if (clampedHeight !== drawerHeightRef.current) {
-        setDrawerHeight(clampedHeight);
-        drawerHeightRef.current = clampedHeight;
-      }
-      if (clampedWidth !== drawerWidthRef.current) {
-        setDrawerWidth(clampedWidth);
-        drawerWidthRef.current = clampedWidth;
-      }
-      if (!resizeStateRef.current) {
-        syncHeight(clampedHeight);
-        syncWidth(clampedWidth);
+      if (dock === "right") {
+        const clampedWidth = clampTerminalDockWidth(drawerWidthRef.current);
+        if (clampedWidth !== drawerWidthRef.current) {
+          setDrawerWidth(clampedWidth);
+          drawerWidthRef.current = clampedWidth;
+        }
+        if (!resizeStateRef.current) {
+          syncWidth(clampedWidth);
+        }
+      } else {
+        const clampedHeight = clampDrawerHeight(drawerHeightRef.current);
+        if (clampedHeight !== drawerHeightRef.current) {
+          setDrawerHeight(clampedHeight);
+          drawerHeightRef.current = clampedHeight;
+        }
+        if (!resizeStateRef.current) {
+          syncHeight(clampedHeight);
+        }
       }
       setResizeEpoch((value) => value + 1);
     };
@@ -1105,7 +1122,7 @@ export default function ThreadTerminalDrawer({
     return () => {
       window.removeEventListener("resize", onWindowResize);
     };
-  }, [syncHeight, syncWidth, visible]);
+  }, [dock, syncHeight, syncWidth, visible]);
 
   useEffect(() => {
     if (!visible) {

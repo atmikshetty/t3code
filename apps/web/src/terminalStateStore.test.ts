@@ -227,7 +227,7 @@ describe("terminalStateStore actions", () => {
     ).toEqual([]);
   });
 
-  it("resets to default and clears persisted entry when closing the last terminal", () => {
+  it("resets to default and clears persisted entry when closing the last terminal with default layout", () => {
     const store = useTerminalStateStore.getState();
     store.closeTerminal(THREAD_ID, "default");
 
@@ -236,6 +236,22 @@ describe("terminalStateStore actions", () => {
       selectThreadTerminalState(useTerminalStateStore.getState().terminalStateByThreadId, THREAD_ID)
         .terminalIds,
     ).toEqual(["default"]);
+  });
+
+  it("preserves dock and sizing preferences when closing the last terminal", () => {
+    const store = useTerminalStateStore.getState();
+    store.setTerminalDock(THREAD_ID, "right");
+    store.setTerminalWidth(THREAD_ID, 540);
+    store.closeTerminal(THREAD_ID, "default");
+
+    const terminalState = selectThreadTerminalState(
+      useTerminalStateStore.getState().terminalStateByThreadId,
+      THREAD_ID,
+    );
+    expect(terminalState.terminalOpen).toBe(false);
+    expect(terminalState.terminalDock).toBe("right");
+    expect(terminalState.terminalWidth).toBe(540);
+    expect(terminalState.terminalIds).toEqual(["default"]);
   });
 
   it("keeps a valid active terminal after closing an active split terminal", () => {

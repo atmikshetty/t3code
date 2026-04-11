@@ -461,7 +461,22 @@ function closeThreadTerminal(state: ThreadTerminalState, terminalId: string): Th
 
   const remainingTerminalIds = normalized.terminalIds.filter((id) => id !== terminalId);
   if (remainingTerminalIds.length === 0) {
-    return createDefaultThreadTerminalState();
+    return normalizeThreadTerminalState({
+      terminalOpen: false,
+      terminalHeight: normalized.terminalHeight,
+      terminalWidth: normalized.terminalWidth,
+      terminalDock: normalized.terminalDock,
+      terminalIds: [DEFAULT_THREAD_TERMINAL_ID],
+      runningTerminalIds: [],
+      activeTerminalId: DEFAULT_THREAD_TERMINAL_ID,
+      terminalGroups: [
+        {
+          id: fallbackGroupId(DEFAULT_THREAD_TERMINAL_ID),
+          terminalIds: [DEFAULT_THREAD_TERMINAL_ID],
+        },
+      ],
+      activeTerminalGroupId: fallbackGroupId(DEFAULT_THREAD_TERMINAL_ID),
+    });
   }
 
   const closedTerminalIndex = normalized.terminalIds.indexOf(terminalId);
