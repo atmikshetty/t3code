@@ -99,9 +99,10 @@ already settled threads.
 ## Import agent history
 
 T3 Code brings your existing Claude Code and Codex conversations into the app.
-A computer imports its history when its server starts, when you sign in to
-Claude Code or Codex there, and when you widen the history window. Conversations
-you start after that are picked up on the next import, so use **Import existing
+While automatic import is on, a computer imports its history when its server
+starts, when you sign in to Claude Code or Codex there, and when you widen the
+history window. Narrowing the window imports nothing new, and conversations you
+start later are picked up on the next import, so use **Import existing
 conversations now** when you want them sooner. T3 Code creates a project for
 each directory those conversations ran in, and reuses a project you already have
 when its directory matches.
