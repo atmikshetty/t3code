@@ -1803,8 +1803,62 @@ it.layer(NodeServices.layer)("AgentSessionScanner", (it) => {
           codexHomePath,
           workspaceRoot: workspace,
         });
+        // The transcript outgrows a whole fresh record allowance, so no later
+        // pass can import it. That is a permanent failure, not remaining work.
+        expect(outcomes[0]).toEqual({ _tag: "Skipped", reason: "unreadable" });
         expect(outcomes.map((outcome) => outcome._tag)).toEqual(["Skipped", "Importable"]);
         expect(outcomes[1]).toMatchObject({ thread: { providerSessionId: "older" } });
+      }),
+    );
+
+    it.effect("tags a record allowance a later pass could refund as budget", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const nowMs = Date.parse("2026-08-24T12:00:00.000Z");
+        yield* TestClock.setTime(nowMs);
+        const claudeHomePath = yield* makeTempDir("t3code-record-refund-claude-");
+        const codexHomePath = yield* makeTempDir("t3code-record-refund-codex-");
+        const workspace = yield* makeTempDir("t3code-record-refund-workspace-");
+        // The newest transcript spends two of the 100_000 records. The older one
+        // holds exactly 100_000, so it overruns what is left yet still fits an
+        // untouched allowance once the first transcript imports.
+        for (const [sessionId, padding, mtimeMs] of [
+          ["small", "", nowMs],
+          ["refundable", "\n".repeat(99_999), nowMs - 1_000],
+        ] as const) {
+          yield* writeTranscript({
+            filePath: path.join(
+              codexHomePath,
+              "sessions",
+              "2026",
+              "08",
+              "24",
+              `rollout-${sessionId}.jsonl`,
+            ),
+            contents:
+              [
+                encodeTranscriptRecord({
+                  type: "session_meta",
+                  payload: { id: sessionId, cwd: workspace },
+                }),
+                encodeTranscriptRecord({
+                  type: "event_msg",
+                  payload: { type: "user_message", message: "Imported prompt" },
+                }),
+              ].join("\n") + padding,
+            mtimeMs,
+          });
+        }
+        const outcomes = yield* runRecentThreadOutcomes({
+          claudeHomePath,
+          codexHomePath,
+          workspaceRoot: workspace,
+        });
+        expect(outcomes[0]).toMatchObject({
+          _tag: "Importable",
+          thread: { providerSessionId: "small" },
+        });
+        expect(outcomes[1]).toEqual({ _tag: "Skipped", reason: "budget" });
       }),
     );
 

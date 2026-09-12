@@ -809,6 +809,14 @@ export const make = Effect.gen(function* () {
    * Project history fields while reading, before allocating whole JSON records.
    * Check the file identity on both sides of the read. A selected-history budget
    * failure rejects the entire transcript before any imported messages persist.
+   *
+   * "BudgetExceeded" is reserved for transcripts a later pass could still
+   * import, so the caller can report them as remaining work rather than as a
+   * permanent failure. Only the shared record allowance qualifies, and only
+   * once this pass has spent part of it: a transcript that outgrows a whole
+   * fresh allowance, one over the per-transcript byte cap, and one whose
+   * selected history alone outgrows MAX_IMPORT_HISTORY_BYTES all fail
+   * identically on every later pass, so they read as "Unreadable".
    */
   const readTranscript = Effect.fn("AgentSessionScanner.readTranscript")(function* (
     filePath: string,
@@ -816,14 +824,17 @@ export const make = Effect.gen(function* () {
     recordLimit: number,
     source: AgentSessionSource,
   ) {
-    if (expected.size > MAX_IMPORTED_TRANSCRIPT_BYTES) return null;
+    const unreadable = { _tag: "Unreadable" } as const;
+    const overRecordLimit =
+      recordLimit < MAX_IMPORT_RECORDS ? ({ _tag: "BudgetExceeded" } as const) : unreadable;
+    if (expected.size > MAX_IMPORTED_TRANSCRIPT_BYTES) return unreadable;
 
     return yield* Effect.scoped(
       fileSystem.open(filePath, { flag: "r" }).pipe(
         Effect.flatMap((file) =>
           Effect.gen(function* () {
             if (!sameTranscriptIdentity(expected, transcriptIdentity(filePath, yield* file.stat))) {
-              return null;
+              return unreadable;
             }
             const records: Array<DecodedTranscriptRecord> = [];
             let historyBytes = 0;
@@ -863,7 +874,7 @@ export const make = Effect.gen(function* () {
                 Math.min(TRANSCRIPT_PREFIX_BYTES, expected.size - bytesRead),
               );
               if (Option.isNone(next)) {
-                return null;
+                return unreadable;
               }
 
               bytesRead += next.value.byteLength;
@@ -880,20 +891,23 @@ export const make = Effect.gen(function* () {
                 }
                 return true;
               });
-              if (!withinBudget) return null;
+              if (!withinBudget) return overRecordLimit;
             }
 
-            if (recordStarted && !(yield* Effect.try(finishRecord))) return null;
+            if (recordStarted && !(yield* Effect.try(finishRecord))) return overRecordLimit;
             return sameTranscriptIdentity(expected, transcriptIdentity(filePath, yield* file.stat))
-              ? { records, recordCount }
-              : null;
+              ? ({ _tag: "Snapshot", records, recordCount } as const)
+              : unreadable;
           }),
         ),
       ),
     ).pipe(
+      // Includes TranscriptJsonLimitError, which rejects a transcript whose own
+      // selected history or nesting depth is past its fixed cap. Nothing a later
+      // pass does changes that, so it stays "Unreadable".
       Effect.catch((cause) =>
         Effect.logWarning("Could not read imported transcript", { filePath, cause }).pipe(
-          Effect.as(null),
+          Effect.as(unreadable),
         ),
       ),
     );
@@ -1407,10 +1421,14 @@ export const make = Effect.gen(function* () {
               source: completedSource,
             });
           }
+          // A transcript over the per-transcript cap never fits, on this pass or
+          // any later one, so it is a permanent failure rather than remaining work.
+          if (identity.size > MAX_IMPORTED_TRANSCRIPT_BYTES) {
+            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped", reason: "unreadable" });
+          }
           if (
             transcriptsRemaining === 0 ||
             recordsRemaining === 0 ||
-            identity.size > MAX_IMPORTED_TRANSCRIPT_BYTES ||
             identity.size > bytesRemaining
           ) {
             return Option.some<AgentSessionRecentThread>({ _tag: "Skipped", reason: "budget" });
@@ -1424,8 +1442,11 @@ export const make = Effect.gen(function* () {
             recordsRemaining,
             candidate.source,
           );
-          if (snapshot === null) {
-            return Option.some<AgentSessionRecentThread>({ _tag: "Skipped", reason: "unreadable" });
+          if (snapshot._tag !== "Snapshot") {
+            return Option.some<AgentSessionRecentThread>({
+              _tag: "Skipped",
+              reason: snapshot._tag === "BudgetExceeded" ? "budget" : "unreadable",
+            });
           }
           recordsRemaining -= snapshot.recordCount;
 
