@@ -34,3 +34,20 @@ export function resolveAgentAwarenessPlatformPresentation(platform: string): {
     ? { supported: true, subtitle: undefined }
     : { supported: false, subtitle: "Unavailable on this platform" };
 }
+
+/** Result of the last "Import now" tap, as of the tap itself. */
+export type AgentSessionImportOutcome = "started" | "failed";
+
+/**
+ * One-line status for the agent history row. Mobile has no import status
+ * subscription, so the copy describes only what the request itself did and
+ * never a run state that would go stale while the screen sits open.
+ */
+export function describeAgentSessionImportOutcome(
+  outcome: AgentSessionImportOutcome,
+  environmentLabel: string,
+): string {
+  return outcome === "started"
+    ? `Import started on ${environmentLabel}. It continues in the background.`
+    : `Import couldn't start on ${environmentLabel}. Try again.`;
+}

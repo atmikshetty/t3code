@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   AGENT_SESSION_IMPORT_WINDOW_LABELS,
+  describeAgentSessionImportOutcome,
   parseAgentSessionImportWindow,
   resolveAgentAwarenessPlatformPresentation,
 } from "./SettingsRouteScreen.logic";
@@ -40,6 +41,20 @@ describe("AGENT_SESSION_IMPORT_WINDOW_LABELS", () => {
   it("labels every import window", () => {
     expect(Object.keys(AGENT_SESSION_IMPORT_WINDOW_LABELS).sort()).toEqual(
       ["30d", "90d", "1y", "all"].sort(),
+    );
+  });
+});
+
+describe("describeAgentSessionImportOutcome", () => {
+  it("names the environment the import runs on", () => {
+    expect(describeAgentSessionImportOutcome("started", "Studio")).toBe(
+      "Import started on Studio. It continues in the background.",
+    );
+  });
+
+  it("says a failed request never started an import", () => {
+    expect(describeAgentSessionImportOutcome("failed", "Studio")).toBe(
+      "Import couldn't start on Studio. Try again.",
     );
   });
 });

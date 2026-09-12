@@ -60,6 +60,8 @@ import { SettingsSwitchRow } from "./components/SettingsSwitchRow";
 import {
   AGENT_SESSION_IMPORT_WINDOW_LABELS,
   AGENT_SESSION_IMPORT_WINDOWS,
+  type AgentSessionImportOutcome,
+  describeAgentSessionImportOutcome,
   parseAgentSessionImportWindow,
   resolveAgentAwarenessPlatformPresentation,
 } from "./SettingsRouteScreen.logic";
@@ -722,8 +724,8 @@ function AgentHistorySettingsRows() {
   });
   const importAll = useAtomCommand(agentSessionImportAll, {
     label: "environment-data:agent-sessions:import-all",
-    // No live status on mobile to surface a failed run, so at least let the
-    // failure reach the log the neighbouring settings commands report to.
+    // The row reports a failed request inline; keep the log the neighbouring
+    // settings commands report to as well, since it carries the cause.
     reportFailure: true,
   });
 
@@ -734,7 +736,7 @@ function AgentHistorySettingsRows() {
   // Mobile has no status subscription, so the row cannot follow a run. Report
   // only what is true at the moment of the tap rather than showing a state
   // label that would then go stale.
-  const [importRequested, setImportRequested] = useState(false);
+  const [importOutcome, setImportOutcome] = useState<AgentSessionImportOutcome | null>(null);
   const importInFlight = useRef(false);
 
   if (reference === null || referenceSettings === null) {
@@ -756,7 +758,11 @@ function AgentHistorySettingsRows() {
     try {
       const result = await importAll({ environmentId: reference.environmentId, input: {} });
       if (result._tag === "Success") {
-        setImportRequested(true);
+        setImportOutcome("started");
+      } else if (!isAtomCommandInterrupted(result)) {
+        // An interrupt means the request never settled, so it says nothing
+        // about the import; leave whatever the row already shows.
+        setImportOutcome("failed");
       }
     } finally {
       importInFlight.current = false;
@@ -798,11 +804,17 @@ function AgentHistorySettingsRows() {
       <View className="flex-row items-center gap-4 border-t border-border-subtle p-4">
         <View className="min-w-0 flex-1">
           <Text className="text-lg text-foreground">Import agent history</Text>
-          {importRequested ? (
-            <Text className="text-sm text-foreground-muted">
-              Import started on {reference.label}. It continues in the background.
+          {importOutcome === null ? null : (
+            <Text
+              className={
+                importOutcome === "failed"
+                  ? "text-sm text-danger-foreground"
+                  : "text-sm text-foreground-muted"
+              }
+            >
+              {describeAgentSessionImportOutcome(importOutcome, reference.label)}
             </Text>
-          ) : null}
+          )}
         </View>
         <Pressable
           accessibilityRole="button"
