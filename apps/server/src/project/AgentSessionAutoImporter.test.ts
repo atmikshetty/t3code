@@ -518,6 +518,51 @@ it.layer(NodeServices.layer)("AgentSessionAutoImporter", (it) => {
       ),
     );
 
+    it.effect("still runs when a stale snapshot lands after an authenticated change", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const scans = yield* Queue.unbounded<void>();
+          const scanner = Layer.succeed(
+            AgentSessionScanner.AgentSessionScanner,
+            AgentSessionScanner.AgentSessionScanner.of({
+              scan: Queue.offer(scans, undefined).pipe(
+                Effect.as({ candidates: [], scannedAt: "2026-08-24T12:00:00.000Z" }),
+              ),
+              recentThreads: () => Stream.empty,
+            }),
+          );
+          const providerSnapshots = yield* SubscriptionRef.make<ReadonlyArray<ServerProvider>>([]);
+          const context = yield* Layer.build(
+            makeHarnessLayer({
+              settings: makeSettingsOverride({}),
+              providerStream: SubscriptionRef.changes(providerSnapshots),
+              scannerOverride: scanner,
+            }),
+          );
+          const importer = Context.get(context, AgentSessionAutoImporter.AgentSessionAutoImporter);
+
+          yield* importer.start();
+          yield* importer.drain;
+          yield* Queue.take(scans);
+
+          // The authenticated change arrives first, then a snapshot read
+          // before it lands within the same debounce window. Debounce keeps
+          // only the last value, so the run must not depend on the
+          // authenticated snapshot being the one that survives.
+          yield* SubscriptionRef.set(providerSnapshots, [
+            makeProviderSnapshot("codex-1", "authenticated"),
+          ]);
+          yield* SubscriptionRef.set(providerSnapshots, [
+            makeProviderSnapshot("codex-1", "unauthenticated"),
+          ]);
+          yield* TestClock.adjust(Duration.seconds(3));
+          yield* Queue.take(scans);
+          yield* importer.drain;
+          expect(yield* importer.status).toMatchObject({ state: "completed", error: null });
+        }),
+      ),
+    );
+
     it.effect("triggers exactly one run for a burst of provider snapshots", () =>
       Effect.scoped(
         Effect.gen(function* () {

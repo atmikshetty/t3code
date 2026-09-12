@@ -319,6 +319,9 @@ export const make = Effect.gen(function* () {
     let lastEnabled = initialSettings.agentSessionAutoImport;
     let lastWindow = initialSettings.agentSessionImportWindow;
     const seenAuthenticated = new Map<string, boolean>();
+    // Set by observing any snapshot, consumed by the debounced decision, so a
+    // transition survives a burst even when its snapshot is not the last one.
+    let authenticationPending = false;
 
     // Startup: run once when the toggle is on. Parked so server boot never waits.
     yield* forkParked(
@@ -333,36 +336,41 @@ export const make = Effect.gen(function* () {
       }),
     );
 
-    // Provider auth: when a claudeAgent/codex instance becomes authenticated
-    // (the first snapshot counts), request a run if the toggle is on.
-    // Debounced latest-wins so a burst of snapshots yields one run.
+    // Provider auth: when a claudeAgent/codex instance becomes authenticated,
+    // request a run if the toggle is on.
     //
-    // ProviderRegistry exposes only streamChanges, which subscribes when the
-    // stream starts rather than here, so a change published while this fibre
-    // is still parked would be lost. Merging the current snapshot in recovers
-    // it: the handler compares against accumulated state rather than reading a
-    // delta, so whichever arrives first settles the same decision.
+    // streamChanges subscribes when the stream starts rather than here, so a
+    // change published while this fibre is still parked would be lost. Merging
+    // the current snapshot in recovers it, but merge gives no ordering between
+    // the two sources, so a snapshot read before that change can arrive after
+    // it. Every emission is therefore observed, and only the decision to act
+    // is debounced: dropping an intermediate snapshot can no longer bury the
+    // transition that a burst was supposed to report.
     yield* forkParked(
       providerRegistry.streamChanges.pipe(
         Stream.merge(Stream.fromEffect(providerRegistry.getProviders)),
-        Stream.debounce(Duration.seconds(2)),
-        Stream.runForEach((providers) =>
-          Effect.gen(function* () {
-            let becameAuthenticated = false;
+        Stream.tap((providers) =>
+          Effect.sync(() => {
             const currentIds = new Set<string>();
             for (const provider of providers) {
               if (provider.driver !== "claudeAgent" && provider.driver !== "codex") continue;
               currentIds.add(provider.instanceId);
               const authenticated = provider.auth.status === "authenticated";
               if (authenticated && seenAuthenticated.get(provider.instanceId) !== true) {
-                becameAuthenticated = true;
+                authenticationPending = true;
               }
               seenAuthenticated.set(provider.instanceId, authenticated);
             }
             for (const instanceId of Array.from(seenAuthenticated.keys())) {
               if (!currentIds.has(instanceId)) seenAuthenticated.delete(instanceId);
             }
-            if (!becameAuthenticated) return;
+          }),
+        ),
+        Stream.debounce(Duration.seconds(2)),
+        Stream.runForEach(() =>
+          Effect.gen(function* () {
+            if (!authenticationPending) return;
+            authenticationPending = false;
             const settings = yield* settingsService.getSettings.pipe(Effect.orDie);
             if (settings.agentSessionAutoImport) {
               yield* requestRun;
