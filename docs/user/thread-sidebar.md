@@ -99,10 +99,12 @@ already settled threads.
 ## Import agent history
 
 T3 Code brings your existing Claude Code and Codex conversations into the app.
-Once an agent on a computer is installed and signed in, that computer's
-conversations import on their own, and new ones follow as you create them.
-T3 Code creates a project for each directory those conversations ran in, and
-reuses a project you already have when its directory matches.
+A computer imports its history when its server starts, when you sign in to
+Claude Code or Codex there, and when you widen the history window. Conversations
+you start after that are picked up on the next import, so use **Import existing
+conversations now** when you want them sooner. T3 Code creates a project for
+each directory those conversations ran in, and reuses a project you already have
+when its directory matches.
 
 Imported conversations arrive as settled threads, so they stay out of your
 active list. Open one and continue it as usual when the agent still has that
@@ -114,6 +116,8 @@ Control this in **Settings → General → Projects & threads**:
 - **History to import** chooses how far back it reaches. All history is the
   default; narrow it to the last 30 days, 90 days, or year if you only want
   recent work.
+- **Import existing conversations now** runs an import straight away, whether or
+  not the automatic import is on.
 
 Turning the setting off stops future imports. It does not remove threads that
 already imported.

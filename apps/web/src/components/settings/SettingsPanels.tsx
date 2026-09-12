@@ -7,6 +7,7 @@ import {
   type AgentSessionImportWindow,
   type BackgroundActivityProfile,
   type DesktopUpdateChannel,
+  type EnvironmentId,
   ProviderDriverKind,
   type ProviderInstanceId,
   type ScopedThreadRef,
@@ -93,7 +94,6 @@ import {
 import { ensureLocalApi, readLocalApi } from "../../localApi";
 import { isMacPlatform } from "../../lib/utils";
 import { EMPTY_SERVER_PROVIDERS } from "../../state/server";
-import { usePrimaryEnvironmentId } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useArchivedThreadSnapshots } from "../../lib/archivedThreadsState";
@@ -2062,10 +2062,15 @@ function summarizeImportFailure(error: string | null): string {
 
 /**
  * The import-now row owns the status subscription, so the stream is only live
- * while this row is mounted and updates re-render just this row.
+ * while this row is mounted and updates re-render just this row. It imports on
+ * the environment the settings scope represents, so a named connection scans
+ * its own machine rather than the primary one.
  */
-function AgentHistoryImportNowRow() {
-  const environmentId = usePrimaryEnvironmentId();
+function AgentHistoryImportNowRow({
+  environmentId,
+}: {
+  readonly environmentId: EnvironmentId | null;
+}) {
   const statusQuery = useEnvironmentQuery(
     environmentId === null ? null : agentSessionImportStatus({ environmentId, input: {} }),
   );
@@ -2079,12 +2084,14 @@ function AgentHistoryImportNowRow() {
     const conversations = `${status.threadsImported} ${
       status.threadsImported === 1 ? "conversation" : "conversations"
     }`;
-    // A repeat run usually adds no projects, and "into 0 projects" reads as a
-    // failure rather than as nothing new to create.
+    // The count is projects created, not projects written to: conversations
+    // also land in projects that already matched a directory. A repeat run
+    // usually creates none, and "into 0 projects" reads as a failure rather
+    // than as nothing new to create, so the two counts stay separate.
     description =
       status.projectsCreated === 0
         ? `Imported ${conversations}.`
-        : `Imported ${conversations} into ${status.projectsCreated} new ${
+        : `Imported ${conversations}. Created ${status.projectsCreated} new ${
             status.projectsCreated === 1 ? "project" : "projects"
           }.`;
   } else if (status?.state === "failed") {
@@ -2105,7 +2112,22 @@ function AgentHistoryImportNowRow() {
           size="sm"
           disabled={environmentId === null || isImporting}
           onClick={() => {
-            if (environmentId !== null) void importAll({ environmentId, input: {} });
+            if (environmentId === null) return;
+            void (async () => {
+              const result = await importAll({ environmentId, input: {} });
+              // The status stream only carries failures the importer itself
+              // reached, so a request that never got there needs its own error.
+              if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+                const error = squashAtomCommandFailure(result);
+                toastManager.add(
+                  stackedThreadToast({
+                    type: "error",
+                    title: "Failed to import agent history",
+                    description: error instanceof Error ? error.message : "An error occurred.",
+                  }),
+                );
+              }
+            })();
           }}
         >
           Import now
@@ -2392,7 +2414,7 @@ export function GeneralSettingsPanel() {
           }
         />
 
-        <AgentHistoryImportNowRow />
+        <AgentHistoryImportNowRow environmentId={environmentId} />
       </SettingsSection>
 
       <SettingsSection id="behavior" title="Behavior">

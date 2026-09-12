@@ -1269,8 +1269,9 @@ function ImportStep({
         </div>
       </ScrollArea>
       <p className="mt-3 text-xs text-muted-foreground">
-        Conversations from Claude Code and Codex come across as settled threads you can continue.
-        Change how far back the import reaches in Settings.
+        Conversations from Claude Code and Codex come across as settled threads you can continue
+        while the agent still has that session on disk. Change how far back the import reaches in
+        Settings.
       </p>
       {importError ? <p className="mt-3 text-sm text-destructive">{importError}</p> : null}
       <div className="mt-6 flex flex-wrap items-center justify-end gap-3">
