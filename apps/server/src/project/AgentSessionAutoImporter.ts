@@ -68,9 +68,14 @@ export const make = Effect.gen(function* () {
     initialAgentSessionAutoImportStatus,
   );
   const runSemaphore = yield* Semaphore.make(1);
-  const isRunning = yield* Ref.make(false);
-  const isQueued = yield* Ref.make(false);
-  const rerunRequested = yield* Ref.make(false);
+  // One record rather than three flags: every decision to enqueue is a single
+  // atomic read-modify-write, so a trigger arriving while a run finishes cannot
+  // enqueue alongside the finaliser and produce two runs for one request.
+  const runState = yield* Ref.make<{
+    readonly running: boolean;
+    readonly queued: boolean;
+    readonly rerun: boolean;
+  }>({ running: false, queued: false, rerun: false });
 
   // importRecentAgentThreads reads its dependencies from context. The
   // auto-importer holds them all, so provide them here instead of at call sites.
@@ -177,13 +182,11 @@ export const make = Effect.gen(function* () {
         imported = result.importedCount;
         skipped = result.skippedCount;
         if (result.remainingCount === 0) break;
-        if (
-          result.importedCount === 0 &&
-          previousRemaining !== null &&
-          result.remainingCount >= previousRemaining
-        ) {
-          break;
-        }
+        // Stop as soon as a pass fails to shrink the backlog. Progress cannot
+        // be judged from importedCount, which counts already-imported threads
+        // and so stays positive forever; a transcript that is permanently over
+        // budget would otherwise loop here without end.
+        if (previousRemaining !== null && result.remainingCount >= previousRemaining) break;
         previousRemaining = result.remainingCount;
       }
       return { imported, skipped };
@@ -266,39 +269,45 @@ export const make = Effect.gen(function* () {
 
   const worker: DrainableWorker<void> = yield* makeDrainableWorker<void, never, never>(() =>
     Effect.gen(function* () {
-      yield* Ref.set(isQueued, false);
-      yield* Ref.set(isRunning, true);
+      yield* Ref.update(runState, (state) => ({ ...state, queued: false, running: true }));
       yield* Effect.gen(function* () {
-        // Triggers arriving mid-run only set rerunRequested, so a burst of
-        // triggers coalesces into exactly one follow-up run.
+        // Triggers arriving mid-run only set rerun, so a burst of triggers
+        // coalesces into exactly one follow-up run.
         let followUp = true;
         while (followUp) {
-          yield* Ref.set(rerunRequested, false);
+          yield* Ref.update(runState, (state) => ({ ...state, rerun: false }));
           yield* performRun();
-          followUp = yield* Ref.getAndSet(rerunRequested, false);
+          followUp = yield* Ref.modify(runState, (state) => [
+            state.rerun,
+            { ...state, rerun: false },
+          ]);
         }
       }).pipe(
         Effect.ensuring(
-          Effect.gen(function* () {
-            yield* Ref.set(isRunning, false);
-            // A trigger that landed after the final flag check already set
-            // rerunRequested; re-enqueue so the run is not lost.
-            if (yield* Ref.getAndSet(rerunRequested, false)) {
-              yield* worker.enqueue(undefined);
-            }
-          }),
+          // Clearing `running` and claiming the follow-up slot in one step is
+          // what keeps a concurrent requestRun from enqueuing a second item:
+          // it either still sees the run in progress, or sees the slot taken.
+          Ref.modify(runState, (state) =>
+            state.rerun
+              ? ([true, { running: false, queued: true, rerun: false }] as const)
+              : ([false, { ...state, running: false }] as const),
+          ).pipe(
+            Effect.flatMap((shouldEnqueue) =>
+              shouldEnqueue ? worker.enqueue(undefined) : Effect.void,
+            ),
+          ),
         ),
       );
     }),
   );
 
-  const requestRun = Effect.gen(function* () {
-    if (yield* Ref.get(isRunning)) {
-      yield* Ref.set(rerunRequested, true);
-    } else if (!(yield* Ref.getAndSet(isQueued, true))) {
-      yield* worker.enqueue(undefined);
-    }
-  });
+  const requestRun = Ref.modify(runState, (state) => {
+    if (state.running) return [false, { ...state, rerun: true }] as const;
+    if (state.queued) return [false, state] as const;
+    return [true, { ...state, queued: true }] as const;
+  }).pipe(
+    Effect.flatMap((shouldEnqueue) => (shouldEnqueue ? worker.enqueue(undefined) : Effect.void)),
+  );
 
   const start: AgentSessionAutoImporter["Service"]["start"] = Effect.fn(
     "AgentSessionAutoImporter.start",
@@ -327,9 +336,15 @@ export const make = Effect.gen(function* () {
     // Provider auth: when a claudeAgent/codex instance becomes authenticated
     // (the first snapshot counts), request a run if the toggle is on.
     // Debounced latest-wins so a burst of snapshots yields one run.
-    // ProviderRegistry exposes only streamChanges (no subscribeChanges).
+    //
+    // ProviderRegistry exposes only streamChanges, which subscribes when the
+    // stream starts rather than here, so a change published while this fibre
+    // is still parked would be lost. Merging the current snapshot in recovers
+    // it: the handler compares against accumulated state rather than reading a
+    // delta, so whichever arrives first settles the same decision.
     yield* forkParked(
       providerRegistry.streamChanges.pipe(
+        Stream.merge(Stream.fromEffect(providerRegistry.getProviders)),
         Stream.debounce(Duration.seconds(2)),
         Stream.runForEach((providers) =>
           Effect.gen(function* () {

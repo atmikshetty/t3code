@@ -277,6 +277,55 @@ it.layer(NodeServices.layer)("AgentSessionAutoImporter", (it) => {
       ),
     );
 
+    it.effect("stops draining a backlog that never shrinks", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fixture = yield* setupCodexFixture({
+            workspaces: [
+              { name: "one", sessionId: "session-one", prompt: "Prompt one", reply: "Reply one" },
+            ],
+          });
+          const settings = settingsWithHomes(fixture, true);
+          const passes = yield* Ref.make(0);
+          // A transcript that is permanently over budget reports the same
+          // remaining count on every pass while already-imported threads keep
+          // importedCount positive, so progress cannot be read from it.
+          const scanner = Layer.effect(
+            AgentSessionScanner.AgentSessionScanner,
+            Effect.gen(function* () {
+              const real = yield* AgentSessionScanner.AgentSessionScanner;
+              return AgentSessionScanner.AgentSessionScanner.of({
+                scan: real.scan,
+                recentThreads: (workspaceRoot, completedSources, options) =>
+                  Stream.unwrap(
+                    Ref.updateAndGet(passes, (count) => count + 1).pipe(
+                      Effect.as(
+                        Stream.concat(
+                          real.recentThreads(workspaceRoot, completedSources, options),
+                          Stream.make({ _tag: "Skipped", reason: "budget" } as const),
+                        ),
+                      ),
+                    ),
+                  ),
+              });
+            }),
+          ).pipe(Layer.provide(Layer.fresh(AgentSessionScanner.layer)));
+          const context = yield* Layer.build(
+            makeHarnessLayer({ settings, providerStream: Stream.empty, scannerOverride: scanner }),
+          );
+          const importer = Context.get(context, AgentSessionAutoImporter.AgentSessionAutoImporter);
+
+          yield* importer.runNow;
+          yield* importer.drain;
+
+          // The run has to end rather than retry a transcript that can never
+          // succeed, and it must not retry indefinitely to discover that.
+          expect(yield* importer.status).toMatchObject({ state: "completed" });
+          expect(yield* Ref.get(passes)).toBeLessThanOrEqual(3);
+        }),
+      ),
+    );
+
     it.effect("counts a drained backlog once instead of once per pass", () =>
       Effect.scoped(
         Effect.gen(function* () {
