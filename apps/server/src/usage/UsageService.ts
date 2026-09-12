@@ -152,7 +152,8 @@ export const make = Effect.gen(function* () {
   let cacheDirty = false;
 
   // OpenCode's incremental state sits beside the file scan cache: same shape
-  // of problem (append-only source, cheap change gate), different medium.
+  // of problem (append-only source, cheap change gate), different medium —
+  // a rowid cursor into `message` rather than a byte offset into a file.
   const openCodeState = createOpenCodeScanState();
 
   const ratesCachePath = path.join(config.stateDir, "usage-model-rates.json");
@@ -427,7 +428,9 @@ export const make = Effect.gen(function* () {
    * transcripts, so it is a sibling source to the directory scan rather than an
    * entry in it: byte-offset resume is meaningless for a database, and the
    * scan cache is keyed on transcript files. Incrementality comes from the
-   * high-water mark the scan state tracks instead.
+   * rowid cursor the scan state tracks instead. The scan reads in chunks and
+   * yields between them, so this stays a genuinely async step rather than a
+   * synchronous read parked behind `Effect.promise`.
    */
   const collectOpenCodeSource = Effect.fn("UsageService.collectOpenCodeSource")(function* (
     retentionCutoffMs: number,

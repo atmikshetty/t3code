@@ -8,9 +8,8 @@ import * as NodeSqlite from "node:sqlite";
 
 import { describe, expect, it } from "@effect/vitest";
 
-import { totalTokens } from "./usageTranscripts.ts";
+import { totalTokens, type UsageRecord } from "./usageTranscripts.ts";
 import {
-  OPENCODE_HWM_OVERLAP_MS,
   createOpenCodeScanState,
   parseOpenCodeMessageRow,
   resolveOpenCodeDatabasePath,
@@ -84,9 +83,69 @@ function insertMessage(
   ).run(id, sessionId, timeCreated, timeCreated, data);
 }
 
-async function withTempDir(
-  run: (dir: string) => Promise<void>,
-): Promise<void> {
+/** Bulk seed, in one transaction: a chunked read needs more rows than a chunk. */
+function insertMessages(
+  db: NodeSqlite.DatabaseSync,
+  count: number,
+  build: (index: number) => {
+    id: string;
+    sessionId: string;
+    timeCreated: number;
+    data?: string;
+  },
+): void {
+  const statement = db.prepare(
+    "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)",
+  );
+  db.exec("BEGIN");
+  for (let index = 0; index < count; index += 1) {
+    const seeded = build(index);
+    statement.run(
+      seeded.id,
+      seeded.sessionId,
+      seeded.timeCreated,
+      seeded.timeCreated,
+      seeded.data ?? assistantPayload(),
+    );
+  }
+  db.exec("COMMIT");
+}
+
+/** The single-query read the chunked scan has to agree with. */
+function readAllMessagesDirectly(dbPath: string): readonly UsageRecord[] {
+  const db = new NodeSqlite.DatabaseSync(dbPath, { readOnly: true });
+  try {
+    const records: UsageRecord[] = [];
+    for (const row of db.prepare("SELECT id, session_id, time_created, data FROM message").all()) {
+      const values = row as Record<string, unknown>;
+      const record = parseOpenCodeMessageRow({
+        id: values["id"],
+        session_id: values["session_id"],
+        time_created: values["time_created"],
+        data: values["data"],
+      });
+      if (record !== null) records.push(record);
+    }
+    return records;
+  } finally {
+    db.close();
+  }
+}
+
+/** Waits out event-loop turns, the beat the chunked read yields on. */
+function eventLoopTurns(count: number): Promise<void> {
+  return new Promise((resolve) => {
+    let left = count;
+    const step = () => {
+      left -= 1;
+      if (left <= 0) resolve();
+      else setImmediate(step);
+    };
+    setImmediate(step);
+  });
+}
+
+async function withTempDir(run: (dir: string) => Promise<void>): Promise<void> {
   const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "opencode-usage-test-"));
   try {
     await run(dir);
@@ -139,9 +198,7 @@ describe("parseOpenCodeMessageRow", () => {
       cost: 0.01,
       tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
     });
-    const record = parseOpenCodeMessageRow(
-      row({ time_created: 1_764_000_000_500, data: payload }),
-    );
+    const record = parseOpenCodeMessageRow(row({ time_created: 1_764_000_000_500, data: payload }));
     expect(record?.timestampMs).toBe(1_764_000_000_500);
 
     // A zero or non-finite payload time is no better than the column.
@@ -218,14 +275,10 @@ describe("parseOpenCodeMessageRow", () => {
   });
 
   it("treats a non-finite cost as no cost", () => {
-    const record = parseOpenCodeMessageRow(
-      row({ data: assistantPayload({ cost: "0.5" }) }),
-    );
+    const record = parseOpenCodeMessageRow(row({ data: assistantPayload({ cost: "0.5" }) }));
     expect(record?.reportedCostUsd).toBeNull();
 
-    const unpriced = parseOpenCodeMessageRow(
-      row({ data: assistantPayload({ cost: Number.NaN }) }),
-    );
+    const unpriced = parseOpenCodeMessageRow(row({ data: assistantPayload({ cost: Number.NaN }) }));
     expect(unpriced?.reportedCostUsd).toBeNull();
   });
 
@@ -249,9 +302,9 @@ describe("parseOpenCodeMessageRow", () => {
 
 describe("resolveOpenCodeDatabasePath", () => {
   it("prefers $XDG_DATA_HOME/opencode", () => {
-    expect(
-      resolveOpenCodeDatabasePath({ xdgDataHome: "/custom/data", homedir: "/home/u" }),
-    ).toBe(NodePath.join("/custom/data", "opencode", "opencode.db"));
+    expect(resolveOpenCodeDatabasePath({ xdgDataHome: "/custom/data", homedir: "/home/u" })).toBe(
+      NodePath.join("/custom/data", "opencode", "opencode.db"),
+    );
   });
 
   it("falls back to ~/.local/share/opencode", () => {
@@ -266,28 +319,21 @@ describe("resolveOpenCodeDatabasePath", () => {
   it("expands a leading ~ in $XDG_DATA_HOME", () => {
     // expandHomePath expands against the process home, so the test's homedir
     // override must agree with it for this case.
-    expect(
-      resolveOpenCodeDatabasePath({ xdgDataHome: "~/xdg", homedir: NodeOS.homedir() }),
-    ).toBe(NodePath.join(NodeOS.homedir(), "xdg", "opencode", "opencode.db"));
+    expect(resolveOpenCodeDatabasePath({ xdgDataHome: "~/xdg", homedir: NodeOS.homedir() })).toBe(
+      NodePath.join(NodeOS.homedir(), "xdg", "opencode", "opencode.db"),
+    );
   });
 });
-
 describe("scanOpenCodeDatabase", () => {
-  it("reads assistant rows and advances the high-water mark from the raw column", async () => {
+  it("reads assistant rows and advances the cursor from the raw rowid", async () => {
     await withTempDir(async (dir) => {
       const dbPath = NodePath.join(dir, "opencode.db");
       const db = await createOpenCodeDatabase(dbPath);
       insertMessage(db, "msg_1", "ses_1", 1000, assistantPayload({ createdMs: 900 }));
       insertMessage(db, "msg_2", "ses_2", 2000, assistantPayload({ createdMs: 2100 }));
       insertMessage(db, "msg_3", "ses_3", 3000, assistantPayload({ role: "user" }));
-      insertMessage(
-        db,
-        "msg_4",
-        "ses_4",
-        4000,
-        assistantPayload({ tokens: {}, cost: 0 }),
-      );
-      await db.close();
+      insertMessage(db, "msg_4", "ses_4", 4000, assistantPayload({ tokens: {}, cost: 0 }));
+      db.close();
 
       const state = createOpenCodeScanState();
       const outcome = await scanOpenCodeDatabase(dbPath, state);
@@ -297,39 +343,111 @@ describe("scanOpenCodeDatabase", () => {
       // The user row and the zero-usage row are not records...
       expect(outcome.records).toHaveLength(2);
       expect(outcome.volumeId).not.toBe("");
-      // ...but they still prove the scan reached their timestamps.
-      expect(state.highWaterMarkMs).toBe(4000);
+      // ...but they still prove the scan passed their rowids.
+      expect(state.highWaterRowId).toBe(4);
       expect(state.hasRead).toBe(true);
       expect(state.records.get("msg_1")?.timestampMs).toBe(900);
       expect(state.records.get("msg_2")?.timestampMs).toBe(2100);
     });
   });
 
-  it("re-reads the overlap window on later scans and collapses the repeats", async () => {
+  it("reports a row committed with a timestamp older than everything already seen", async () => {
+    // Finding B: OpenCode writes `time_created` from the writer's wall clock
+    // across concurrent sessions, so a new row can carry a timestamp well
+    // behind rows already scanned. A timestamp cursor loses it forever; the
+    // rowid cursor cannot, because the row is still an insert.
     await withTempDir(async (dir) => {
       const dbPath = NodePath.join(dir, "opencode.db");
       const db = await createOpenCodeDatabase(dbPath);
-      insertMessage(db, "msg_1", "ses_1", 1000, assistantPayload());
-      insertMessage(db, "msg_2", "ses_2", 2000, assistantPayload());
-      await db.close();
+      insertMessage(db, "msg_1", "ses_1", 1_764_000_000_000, assistantPayload());
+      insertMessage(db, "msg_2", "ses_2", 1_764_000_600_000, assistantPayload());
+      db.close();
 
       const state = createOpenCodeScanState();
       const first = await scanOpenCodeDatabase(dbPath, state);
       expect(first.status === "ok" ? first.records : []).toHaveLength(2);
+      expect(state.highWaterRowId).toBe(2);
 
-      // A concurrent session commits a message whose timestamp lands slightly
-      // behind the mark, the shape the overlap exists to catch.
-      const db2 = new NodeSqlite.DatabaseSync(dbPath);
-      insertMessage(db2, "msg_3", "ses_3", 2000 - OPENCODE_HWM_OVERLAP_MS / 2, assistantPayload());
-      await db2.close();
+      // An hour behind the newest row already read, far outside any overlap
+      // window a timestamp cursor could reasonably carry.
+      const late = new NodeSqlite.DatabaseSync(dbPath);
+      insertMessage(late, "msg_3", "ses_3", 1_764_000_600_000 - 60 * 60 * 1000, assistantPayload());
+      late.close();
 
       const second = await scanOpenCodeDatabase(dbPath, state);
       expect(second.status).toBe("ok");
       if (second.status !== "ok") return;
       expect(second.records).toHaveLength(3);
-      expect(state.highWaterMarkMs).toBe(2000);
-      // The overlap re-read msg_1/msg_2 by timestamp; the ids collapse them.
-      expect(new Set(second.records.map((record) => record.dedupeKey)).size).toBe(3);
+      expect(second.records.map((record) => record.dedupeKey)).toContain("msg_3");
+      expect(state.highWaterRowId).toBe(3);
+    });
+  });
+
+  it("re-reads from scratch when the newest rows were deleted", async () => {
+    // SQLite hands a deleted rowid straight back to the next insert once it
+    // was the largest, so a cursor left above the table's maximum would skip
+    // whatever reuses it.
+    await withTempDir(async (dir) => {
+      const dbPath = NodePath.join(dir, "opencode.db");
+      const db = await createOpenCodeDatabase(dbPath);
+      insertMessage(db, "msg_1", "ses_1", 1000, assistantPayload());
+      insertMessage(db, "msg_2", "ses_2", 2000, assistantPayload());
+      db.close();
+
+      const state = createOpenCodeScanState();
+      await scanOpenCodeDatabase(dbPath, state);
+      expect(state.highWaterRowId).toBe(2);
+
+      const editor = new NodeSqlite.DatabaseSync(dbPath);
+      editor.exec("DELETE FROM message WHERE id = 'msg_2'");
+      // Reuses rowid 2, which the old cursor already passed.
+      insertMessage(editor, "msg_3", "ses_3", 3000, assistantPayload());
+      expect(editor.prepare("SELECT rowid AS r FROM message WHERE id = 'msg_3'").get()?.["r"]).toBe(
+        2,
+      );
+      editor.close();
+
+      const second = await scanOpenCodeDatabase(dbPath, state);
+      expect(second.status).toBe("ok");
+      if (second.status !== "ok") return;
+      expect(second.records.map((record) => record.dedupeKey)).toContain("msg_3");
+      expect(state.highWaterRowId).toBe(2);
+    });
+  });
+
+  it("re-reads when a commit only touched the -wal sidecar", async () => {
+    // Finding C: OpenCode commits through WAL with its connection open, so a
+    // new message lands in `opencode.db-wal` and leaves `opencode.db` byte for
+    // byte identical until a checkpoint. A gate that watched only the main
+    // file would report stale usage for as long as that takes.
+    await withTempDir(async (dir) => {
+      const dbPath = NodePath.join(dir, "opencode.db");
+      const db = await createOpenCodeDatabase(dbPath);
+      try {
+        const mode = db.prepare("PRAGMA journal_mode = WAL").get();
+        expect(mode?.["journal_mode"]).toBe("wal");
+        insertMessage(db, "msg_1", "ses_1", 1000, assistantPayload());
+
+        const state = createOpenCodeScanState();
+        const first = await scanOpenCodeDatabase(dbPath, state);
+        expect(first.status === "ok" ? first.records : []).toHaveLength(1);
+
+        const before = await NodeFSP.stat(dbPath);
+        insertMessage(db, "msg_2", "ses_2", 2000, assistantPayload());
+        const after = await NodeFSP.stat(dbPath);
+
+        // The shape the fix exists for: nothing about the main file moved.
+        expect(after.size).toBe(before.size);
+        expect(after.mtimeMs).toBe(before.mtimeMs);
+        await expect(NodeFSP.stat(`${dbPath}-wal`)).resolves.toBeDefined();
+
+        const second = await scanOpenCodeDatabase(dbPath, state);
+        expect(second.status).toBe("ok");
+        if (second.status !== "ok") return;
+        expect(second.records).toHaveLength(2);
+      } finally {
+        db.close();
+      }
     });
   });
 
@@ -338,7 +456,7 @@ describe("scanOpenCodeDatabase", () => {
       const dbPath = NodePath.join(dir, "opencode.db");
       const db = await createOpenCodeDatabase(dbPath);
       insertMessage(db, "msg_1", "ses_1", 1000, assistantPayload());
-      await db.close();
+      db.close();
 
       // Pin a whole-millisecond mtime so the gate comparison is exact.
       const pinnedMs = 1_764_000_000_000;
@@ -362,31 +480,141 @@ describe("scanOpenCodeDatabase", () => {
     });
   });
 
-  it("forgets its state when the database file is replaced", async () => {
+  it("forgets its state when the database file is replaced between scans", async () => {
     await withTempDir(async (dir) => {
       const dbPath = NodePath.join(dir, "opencode.db");
       const db = await createOpenCodeDatabase(dbPath);
       insertMessage(db, "msg_1", "ses_1", 1000, assistantPayload());
-      await db.close();
+      insertMessage(db, "msg_2", "ses_2", 2000, assistantPayload());
+      db.close();
 
       const state = createOpenCodeScanState();
       const first = await scanOpenCodeDatabase(dbPath, state);
-      expect(first.status === "ok" ? first.records : []).toHaveLength(1);
+      expect(first.status === "ok" ? first.records : []).toHaveLength(2);
 
       // A different database moved over the path keeps its own inode, so the
       // volume identity changes and the state must reset.
       const replacementPath = NodePath.join(dir, "replacement.db");
       const replacement = await createOpenCodeDatabase(replacementPath);
       insertMessage(replacement, "msg_9", "ses_9", 500, assistantPayload());
-      await replacement.close();
+      replacement.close();
       await NodeFSP.rename(replacementPath, dbPath);
 
       const second = await scanOpenCodeDatabase(dbPath, state);
       expect(second.status).toBe("ok");
       if (second.status !== "ok") return;
-      expect(second.records).toHaveLength(1);
-      expect(second.records[0]?.dedupeKey).toBe("msg_9");
-      expect(state.highWaterMarkMs).toBe(500);
+      // Only the new database's rows: no record of the old one survives.
+      expect(second.records.map((record) => record.dedupeKey)).toEqual(["msg_9"]);
+      expect(state.highWaterRowId).toBe(1);
+    });
+  });
+
+  it("does not merge rows read before a mid-scan replacement", async () => {
+    // Finding D: the file can be swapped after the scan stats it and after it
+    // opens it, so the rows in hand may belong to a database the path no
+    // longer points at. The scan must notice and start over rather than merge.
+    await withTempDir(async (dir) => {
+      const dbPath = NodePath.join(dir, "opencode.db");
+      // Large enough that the chunked read spans many event-loop turns, so
+      // the swap below lands after the open and before the read finishes.
+      const db = await createOpenCodeDatabase(dbPath);
+      insertMessages(db, 5000, (index) => ({
+        id: `msg_old_${index}`,
+        sessionId: "ses_old",
+        timeCreated: 1_764_000_000_000 + index,
+      }));
+      db.close();
+
+      const replacementPath = NodePath.join(dir, "replacement.db");
+      const replacement = await createOpenCodeDatabase(replacementPath);
+      insertMessage(replacement, "msg_new", "ses_new", 1000, assistantPayload());
+      replacement.close();
+
+      const state = createOpenCodeScanState();
+      const scan = scanOpenCodeDatabase(dbPath, state);
+      await eventLoopTurns(6);
+      await NodeFSP.rename(replacementPath, dbPath);
+      const outcome = await scan;
+
+      expect(outcome.status).toBe("ok");
+      if (outcome.status !== "ok") return;
+      expect(outcome.records.map((record) => record.dedupeKey)).toEqual(["msg_new"]);
+      expect(state.highWaterRowId).toBe(1);
+    });
+  });
+
+  it("reads the same records in chunks as a single query would", async () => {
+    // Finding A: the read is split so it cannot hold the event loop for a
+    // whole history. Splitting it must not change what it returns, including
+    // at an exact chunk boundary.
+    await withTempDir(async (dir) => {
+      const dbPath = NodePath.join(dir, "opencode.db");
+      const db = await createOpenCodeDatabase(dbPath);
+      // 1000 rows is an exact multiple of the 500-row chunk, the boundary a
+      // `LIMIT`-and-cursor loop is most likely to get wrong.
+      insertMessages(db, 1000, (index) => ({
+        id: `msg_${index}`,
+        sessionId: `ses_${index % 7}`,
+        timeCreated: 1_764_000_000_000 + index,
+        // Every third row carries no usage, so skipped rows fall on and off
+        // the chunk boundaries too.
+        data:
+          index % 3 === 0
+            ? assistantPayload({ role: "user" })
+            : assistantPayload({ createdMs: 1_764_000_000_000 + index }),
+      }));
+      db.close();
+
+      const expected = readAllMessagesDirectly(dbPath);
+
+      const state = createOpenCodeScanState();
+      const outcome = await scanOpenCodeDatabase(dbPath, state);
+      expect(outcome.status).toBe("ok");
+      if (outcome.status !== "ok") return;
+
+      const byKey = (records: readonly { dedupeKey: string | null }[]) =>
+        records.map((record) => record.dedupeKey).sort();
+      expect(outcome.records).toHaveLength(expected.length);
+      expect(byKey(outcome.records)).toEqual(byKey(expected));
+      expect(state.highWaterRowId).toBe(1000);
+
+      // And a second pass over an unchanged database adds nothing.
+      const again = await scanOpenCodeDatabase(dbPath, state);
+      expect(again.status === "ok" ? again.records.length : -1).toBe(expected.length);
+    });
+  });
+
+  it("hands the event loop back while it reads", async () => {
+    // Finding A: both SQLite bindings read synchronously, so a cold scan of a
+    // long history would hold the loop for the whole read and stall every
+    // other request. Chunking is only worth anything if it actually yields.
+    await withTempDir(async (dir) => {
+      const dbPath = NodePath.join(dir, "opencode.db");
+      const db = await createOpenCodeDatabase(dbPath);
+      insertMessages(db, 5000, (index) => ({
+        id: `msg_${index}`,
+        sessionId: "ses_1",
+        timeCreated: 1_764_000_000_000 + index,
+      }));
+      db.close();
+
+      let turns = 0;
+      let scanning = true;
+      const tick = () => {
+        if (!scanning) return;
+        turns += 1;
+        setImmediate(tick);
+      };
+      setImmediate(tick);
+
+      const state = createOpenCodeScanState();
+      const outcome = await scanOpenCodeDatabase(dbPath, state);
+      scanning = false;
+
+      expect(outcome.status === "ok" ? outcome.records.length : -1).toBe(5000);
+      // 5000 rows is ten chunks, so nine yields at the very least. A read that
+      // never yielded would let this run only while the scan awaits its stats.
+      expect(turns).toBeGreaterThan(8);
     });
   });
 
@@ -406,7 +634,7 @@ describe("scanOpenCodeDatabase", () => {
       // And a retry neither throws nor poisons the state.
       const second = await scanOpenCodeDatabase(dbPath, state);
       expect(second.status).toBe("failed");
-      expect(state.highWaterMarkMs).toBe(0);
+      expect(state.highWaterRowId).toBe(0);
     });
   });
 
@@ -426,7 +654,7 @@ describe("scanOpenCodeDatabase", () => {
       // The record's timestamp comes from the payload clock, so pin it low
       // enough to sit under the cutoff.
       insertMessage(db, "msg_1", "ses_1", 1000, assistantPayload({ createdMs: 1000 }));
-      await db.close();
+      db.close();
 
       const state = createOpenCodeScanState();
       const pruned = await scanOpenCodeDatabase(dbPath, state, { retentionCutoffMs: 5000 });

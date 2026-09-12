@@ -8,16 +8,20 @@
  * in `usageTranscriptReader` — "resume from an offset" is meaningless for a
  * database. This module is the seam between the two source kinds: a pure
  * row-to-record mapper, and a stateful reader that opens the database
- * read-only and re-reads only what a high-water mark says it must.
+ * read-only and re-reads only what a cursor says it must.
  *
- * Rows in `message` are immutable once written, so a high-water mark on
- * `time_created` is safe: a row already read can never come back changed.
- * The mark plus the database file's `(size, mtime)` form the cheap
+ * Rows in `message` are immutable once written, so a cursor is safe: a row
+ * already read can never come back changed. The cursor plus the `(size,
+ * mtime)` of the database file *and its `-wal` sidecar* form the cheap
  * "nothing changed" gate that lets a warm scan skip reopening the database.
  *
  * Only the `message` table is ever queried, and only four columns of it.
  * OpenCode's `part` table (tool output) is the bulk of the file by far and
  * never carries usage; touching it would make every scan enormously slow.
+ *
+ * Both bindings available to the server read SQLite synchronously, so the read
+ * is chunked and yields to the event loop between chunks: a cold scan of a
+ * large history must not hold the loop for the whole read.
  *
  * @module usageOpenCodeDatabase
  */
@@ -31,23 +35,41 @@ import { totalTokens, type UsageRecord } from "./usageTranscripts.ts";
 import { expandHomePath } from "../pathExpansion.ts";
 
 /**
- * How far behind the high-water mark each re-read reaches.
+ * Longest a read waits out an active writer before degrading.
  *
- * `time_created` comes from the writer's wall clock and several OpenCode
- * sessions can be in flight at once, so it is not monotonic across rows: a
- * message can commit with a timestamp slightly behind one already scanned,
- * and clock adjustment does the same. The mark therefore queries from
- * `mark - overlap` rather than `mark`. The overlap re-reads are free: every
- * record carries the message id as its dedupe key, and the aggregator
- * de-duplicates the whole scan globally.
+ * Kept well under a frame budget's worth of user-visible stall: the read runs
+ * synchronously on the event loop, so this is dead time for every other
+ * request too. A database genuinely held by a writer degrades to a `failed`
+ * outcome instead, which the usage screen already reports per source.
  */
-export const OPENCODE_HWM_OVERLAP_MS = 5 * 60 * 1000;
+const BUSY_TIMEOUT_MS = 200;
 
-/** Longest a read waits out an active writer before degrading. */
-const BUSY_TIMEOUT_MS = 3000;
+/**
+ * Rows per synchronous read step.
+ *
+ * Measured on a synthetic 60,000-row database shaped like OpenCode's: at 500
+ * rows a query-plus-parse step costs ~0.7 ms at the real average row width
+ * (~425 bytes of `data`) and ~2 ms at a pessimistic 2 KB, against ~93-130 ms
+ * for the same scan read in one shot. The 121 yields a cold scan of that size
+ * needs cost under 5 ms in total, so chunking is effectively free.
+ */
+const MESSAGE_CHUNK_ROWS = 500;
 
-const MESSAGE_ROWS_SQL =
-  "SELECT id, session_id, time_created, data FROM message WHERE time_created > ?";
+/** Suffix of the write-ahead log sidecar OpenCode commits through. */
+const WAL_SUFFIX = "-wal";
+
+/**
+ * How many times a scan re-reads after finding the file was swapped underneath
+ * it. A swap is rare and settles immediately; a path that keeps changing
+ * identity degrades rather than spinning.
+ */
+const MAX_SCAN_ATTEMPTS = 3;
+
+const MESSAGE_CHUNK_SQL =
+  "SELECT rowid AS row_id, id, session_id, time_created, data FROM message" +
+  " WHERE rowid > ? ORDER BY rowid LIMIT ?";
+
+const MESSAGE_ID_AT_SQL = "SELECT id FROM message WHERE rowid = ?";
 
 /**
  * Raw shape of one `message` row, narrowed to the four columns this source
@@ -77,9 +99,9 @@ function tokenCount(value: unknown): number {
  * token exactly once.
  */
 export function parseOpenCodeMessageRow(row: OpenCodeMessageRow): UsageRecord | null {
-  // The message id is the record's dedupe key, and the overlap re-reads
-  // depend on it collapsing: a row without one must not be emitted at all,
-  // or every warm scan would double count it.
+  // The message id is the record's dedupe key, and the scan keys its cache on
+  // it: a row without one must not be emitted at all, or a re-read would
+  // double count it.
   if (typeof row.id !== "string" || row.id.length === 0) return null;
 
   if (typeof row.data !== "string") return null;
@@ -187,13 +209,39 @@ export interface OpenCodeScanState {
   /** Every record read so far, keyed by message id (the dedupe key). */
   readonly records: Map<string, UsageRecord>;
   /**
-   * Highest `message.time_created` column value read so far. Rows are
-   * immutable, so everything at or below the mark is already on hand.
+   * Highest `message` rowid read so far; the next scan reads `rowid >` this.
+   *
+   * The cursor is the rowid and deliberately NOT `time_created`. Timestamps
+   * come from the writer's wall clock across concurrent sessions, so they move
+   * backwards relative to insert order — on a real installation ~1% of rows
+   * carry a `time_created` lower than the row inserted before them. A
+   * timestamp cursor drops every one of those rows permanently. Rowids only
+   * ever increase with insert order, so `rowid > cursor` cannot miss a row and
+   * needs no overlap window. `time.created` still buckets a record into a day;
+   * only the cursor changed.
    */
-  highWaterMarkMs: number;
+  highWaterRowId: number;
+  /**
+   * Message id of the row the cursor sits on, which proves the cursor still
+   * means what it meant. SQLite hands a deleted rowid back to the next insert
+   * once it was the largest one, so a cursor left alone could point at a
+   * different message, or at none, and silently skip everything above it.
+   */
+  highWaterMessageId: string;
   /** `(size, mtime)` of the database file the records came from. */
   size: number;
   mtimeMs: number;
+  /**
+   * `(size, mtime)` of the `-wal` sidecar, or `-1` when there is none.
+   *
+   * OpenCode commits through WAL, so a new message appends to `opencode.db-wal`
+   * and can leave `opencode.db` untouched until a checkpoint. Without the
+   * sidecar in the gate a warm scan would report stale usage for as long as
+   * the checkpoint takes. A database not in WAL mode simply has no sidecar,
+   * which is a valid state, not an error.
+   */
+  walSize: number;
+  walMtimeMs: number;
   /** Filesystem identity of the database file, as `device:inode`. */
   volumeId: string;
   /** False until a read succeeds, so the first scan cannot take the fast path. */
@@ -203,12 +251,32 @@ export interface OpenCodeScanState {
 export function createOpenCodeScanState(): OpenCodeScanState {
   return {
     records: new Map(),
-    highWaterMarkMs: 0,
+    highWaterRowId: 0,
+    highWaterMessageId: "",
     size: -1,
     mtimeMs: -1,
+    walSize: -1,
+    walMtimeMs: -1,
     volumeId: "",
     hasRead: false,
   };
+}
+
+/**
+ * Drops everything read from a database that is no longer the one at the path.
+ * A replacement shares no rowids with what came before, so merging the two
+ * would stitch together records from two different databases.
+ */
+function forgetOpenCodeScanState(state: OpenCodeScanState): void {
+  state.records.clear();
+  state.highWaterRowId = 0;
+  state.highWaterMessageId = "";
+  state.size = -1;
+  state.mtimeMs = -1;
+  state.walSize = -1;
+  state.walMtimeMs = -1;
+  state.volumeId = "";
+  state.hasRead = false;
 }
 
 export type OpenCodeScanOutcome =
@@ -219,20 +287,33 @@ export type OpenCodeScanOutcome =
 export interface OpenCodeScanOptions {
   /**
    * Cached records older than this are dropped, mirroring the file scan
-   * cache's retention: they sit behind the high-water mark and beyond the
-   * longest window the UI offers, so they would only cost memory.
+   * cache's retention: they sit behind the cursor and beyond the longest
+   * window the UI offers, so they would only cost memory.
    */
   readonly retentionCutoffMs?: number;
+}
+
+async function statOrNull(path: string): Promise<NodeFS.Stats | null> {
+  try {
+    return await NodeFSP.stat(path);
+  } catch {
+    return null;
+  }
+}
+
+async function readVolumeId(path: string): Promise<string> {
+  const stats = await statOrNull(path);
+  return stats === null ? "" : `${stats.dev}:${stats.ino}`;
 }
 
 /**
  * Reads OpenCode's database and returns the source's full record set.
  *
- * Incremental by high-water mark: a warm scan reopens the database only when
- * its `(size, mtime)` changed, and then queries only rows newer than
- * `mark - overlap`, merging them into the records already held. This never
- * rejects — a locked, busy, corrupt or missing database degrades to a
- * `missing`/`failed` outcome so the usage read keeps working for every other
+ * Incremental by rowid cursor: a warm scan reopens the database only when the
+ * `(size, mtime)` of the file or its `-wal` sidecar changed, and then reads
+ * only rows above the cursor, merging them into the records already held.
+ * This never rejects — a locked, busy, corrupt or missing database degrades to
+ * a `missing`/`failed` outcome so the usage read keeps working for every other
  * provider, exactly as a missing transcript directory does.
  */
 export async function scanOpenCodeDatabase(
@@ -242,50 +323,70 @@ export async function scanOpenCodeDatabase(
 ): Promise<OpenCodeScanOutcome> {
   let volumeId = "";
   try {
-    let stats: NodeFS.Stats;
-    try {
-      stats = await NodeFSP.stat(dbPath);
-    } catch {
-      return { status: "missing", volumeId };
-    }
-    volumeId = `${stats.dev}:${stats.ino}`;
+    for (let attempt = 1; ; attempt += 1) {
+      const stats = await statOrNull(dbPath);
+      if (stats === null) return { status: "missing", volumeId: "" };
+      volumeId = `${stats.dev}:${stats.ino}`;
+      const wal = await statOrNull(`${dbPath}${WAL_SUFFIX}`);
+      const walSize = wal === null ? -1 : wal.size;
+      const walMtimeMs = wal === null ? -1 : wal.mtimeMs;
 
-    // A replaced database file (a restore, a VACUUM rewrite) shares nothing
-    // with the rows already held: forget the cache and the mark rather than
-    // stitching two different databases together.
-    if (state.hasRead && state.volumeId !== volumeId) {
-      state.records.clear();
-      state.highWaterMarkMs = 0;
-      state.hasRead = false;
-    }
+      // A replaced database file (a restore, a VACUUM rewrite) shares nothing
+      // with the rows already held: forget the cache and the cursor rather
+      // than stitching two different databases together.
+      if (state.hasRead && state.volumeId !== volumeId) forgetOpenCodeScanState(state);
 
-    // Cheap "nothing changed" gate. OpenCode only ever adds rows, so an
-    // unchanged `(size, mtime)` means the held records are still complete —
-    // the same gate the file pipeline caches parsed files on.
-    if (state.hasRead && state.size === stats.size && state.mtimeMs === stats.mtimeMs) {
+      // Cheap "nothing changed" gate. Neither file moving means nothing was
+      // written to the database at all, so the held records are still
+      // complete — the same gate the file pipeline caches parsed files on.
+      if (
+        state.hasRead &&
+        state.size === stats.size &&
+        state.mtimeMs === stats.mtimeMs &&
+        state.walSize === walSize &&
+        state.walMtimeMs === walMtimeMs
+      ) {
+        pruneOpenCodeRecords(state, options.retentionCutoffMs);
+        return { status: "ok", volumeId, records: [...state.records.values()] };
+      }
+
+      const read = await readOpenCodeMessageRows(
+        dbPath,
+        state.highWaterRowId,
+        state.highWaterMessageId,
+      );
+
+      // The stat above and the open below are not atomic, and the read spans
+      // several steps: if the path stopped pointing at the file this scan
+      // measured, the rows just read may belong to a different database.
+      // Start over against whatever is there now instead of merging.
+      if (read.openedVolumeId !== volumeId || read.closingVolumeId !== volumeId) {
+        forgetOpenCodeScanState(state);
+        if (attempt < MAX_SCAN_ATTEMPTS) continue;
+        return {
+          status: "failed",
+          volumeId,
+          detail: "OpenCode database kept being replaced while it was read.",
+        };
+      }
+
+      for (const record of read.records) {
+        // parseOpenCodeMessageRow only emits records that carry the message id
+        // as their dedupe key, so this merge is idempotent.
+        if (record.dedupeKey !== null) state.records.set(record.dedupeKey, record);
+      }
+      state.highWaterRowId = read.nextRowId;
+      state.highWaterMessageId = read.nextMessageId;
+      state.size = stats.size;
+      state.mtimeMs = stats.mtimeMs;
+      state.walSize = walSize;
+      state.walMtimeMs = walMtimeMs;
+      state.volumeId = volumeId;
+      state.hasRead = true;
       pruneOpenCodeRecords(state, options.retentionCutoffMs);
+
       return { status: "ok", volumeId, records: [...state.records.values()] };
     }
-
-    const read = await readOpenCodeMessageRows(
-      dbPath,
-      state.highWaterMarkMs - OPENCODE_HWM_OVERLAP_MS,
-    );
-    for (const record of read.records) {
-      // parseOpenCodeMessageRow only emits records that carry the message id
-      // as their dedupe key, so this merge is where overlap re-reads collapse.
-      if (record.dedupeKey !== null) state.records.set(record.dedupeKey, record);
-    }
-    // Never backwards: a scan that read nothing (or only overlap repeats)
-    // must not undo the mark a previous scan advanced.
-    state.highWaterMarkMs = Math.max(state.highWaterMarkMs, read.maxRowTimeCreatedMs);
-    state.size = stats.size;
-    state.mtimeMs = stats.mtimeMs;
-    state.volumeId = volumeId;
-    state.hasRead = true;
-    pruneOpenCodeRecords(state, options.retentionCutoffMs);
-
-    return { status: "ok", volumeId, records: [...state.records.values()] };
   } catch (cause) {
     return { status: "failed", volumeId, detail: boundedDetail(cause) };
   }
@@ -307,12 +408,20 @@ function boundedDetail(cause: unknown): string {
 /**
  * The two SQLite bindings the server supports, behind one read-only face.
  * `persistence/Layers/Sqlite.ts` makes the same runtime split for T3 Code's
- * own database.
+ * own database. Every method runs synchronously, which is why the caller
+ * reads in chunks.
  */
 interface ReadOnlyOpenCodeDatabase {
   setBusyTimeout(ms: number): void;
-  queryMessageRows(sinceExclusiveMs: number): readonly unknown[];
+  /** Message id at a rowid, or `""` when no row holds it any more. */
+  messageIdAt(rowId: number): string;
+  queryMessageChunk(afterRowId: number, limit: number): readonly unknown[];
   close(): void;
+}
+
+function messageIdOf(result: unknown): string {
+  const value = (result as Record<string, unknown> | undefined | null)?.["id"];
+  return typeof value === "string" ? value : "";
 }
 
 /**
@@ -325,61 +434,106 @@ async function openOpenCodeDatabase(dbPath: string): Promise<ReadOnlyOpenCodeDat
   if (process.versions.bun !== undefined) {
     const { Database } = await import("bun:sqlite");
     const db = new Database(dbPath, { readonly: true, create: false });
+    const chunk = db.query(MESSAGE_CHUNK_SQL);
+    const idAt = db.query(MESSAGE_ID_AT_SQL);
     return {
       setBusyTimeout: (ms) => db.exec(`PRAGMA busy_timeout = ${ms};`),
-      queryMessageRows: (sinceExclusiveMs) =>
-        db.query(MESSAGE_ROWS_SQL).all(sinceExclusiveMs) as readonly unknown[],
+      messageIdAt: (rowId) => messageIdOf(idAt.get(rowId)),
+      queryMessageChunk: (afterRowId, limit) => chunk.all(afterRowId, limit) as readonly unknown[],
       close: () => db.close(),
     };
   }
   const { DatabaseSync } = await import("node:sqlite");
   const db = new DatabaseSync(dbPath, { readOnly: true });
+  const chunk = db.prepare(MESSAGE_CHUNK_SQL);
+  const idAt = db.prepare(MESSAGE_ID_AT_SQL);
   return {
     setBusyTimeout: (ms) => db.exec(`PRAGMA busy_timeout = ${ms};`),
-    queryMessageRows: (sinceExclusiveMs) =>
-      db.prepare(MESSAGE_ROWS_SQL).all(sinceExclusiveMs) as readonly unknown[],
+    messageIdAt: (rowId) => messageIdOf(idAt.get(rowId)),
+    queryMessageChunk: (afterRowId, limit) => chunk.all(afterRowId, limit) as readonly unknown[],
     close: () => db.close(),
   };
 }
 
+/** Hands the event loop back so other requests run between read steps. */
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
+interface OpenCodeRead {
+  readonly records: readonly UsageRecord[];
+  /** Cursor for the next scan: the highest rowid this read reached. */
+  readonly nextRowId: number;
+  /** Message id sitting at `nextRowId`, so the next scan can trust it. */
+  readonly nextMessageId: string;
+  /** Identity of the path right after the open, for the caller's swap check. */
+  readonly openedVolumeId: string;
+  /** Identity of the path once the read finished, still holding the handle. */
+  readonly closingVolumeId: string;
+}
+
 async function readOpenCodeMessageRows(
   dbPath: string,
-  sinceExclusiveMs: number,
-): Promise<{ readonly records: readonly UsageRecord[]; readonly maxRowTimeCreatedMs: number }> {
+  fromRowId: number,
+  fromMessageId: string,
+): Promise<OpenCodeRead> {
   const db = await openOpenCodeDatabase(dbPath);
   try {
-    // Best effort: a busy timeout lets a scan ride out a brief writer lock
-    // instead of degrading for that scan. The pragma writes nothing.
+    const openedVolumeId = await readVolumeId(dbPath);
+    // Best effort: a busy timeout lets a chunk ride out a brief writer lock
+    // instead of degrading the whole scan. The pragma writes nothing.
     try {
       db.setBusyTimeout(BUSY_TIMEOUT_MS);
     } catch {
-      // Ignore; the read below still degrades cleanly on a real lock.
+      // Ignore; the reads below still degrade cleanly on a real lock.
     }
-    const rows = db.queryMessageRows(sinceExclusiveMs);
+
+    let cursor = fromRowId;
+    let cursorMessageId = fromMessageId;
+    // SQLite hands a deleted rowid back to the next insert once it was the
+    // largest one, so the cursor can come to rest on a row that is gone or on
+    // a different message, with unread rows above it. Reading from scratch
+    // after a tail deletion is cheap next to losing those rows.
+    if (cursor > 0 && cursorMessageId.length > 0 && db.messageIdAt(cursor) !== cursorMessageId) {
+      cursor = 0;
+      cursorMessageId = "";
+    }
 
     const records: UsageRecord[] = [];
-    let maxRowTimeCreatedMs = 0;
-    for (const row of rows) {
-      const values = row as Record<string, unknown>;
-      // The mark advances from the raw column, not from parsed records: rows
-      // skipped as non-usage still prove the scan reached their timestamp.
-      const rowTimeCreated = values["time_created"];
-      if (
-        typeof rowTimeCreated === "number" &&
-        Number.isFinite(rowTimeCreated) &&
-        rowTimeCreated > maxRowTimeCreatedMs
-      ) {
-        maxRowTimeCreatedMs = rowTimeCreated;
+    for (;;) {
+      const rows = db.queryMessageChunk(cursor, MESSAGE_CHUNK_ROWS);
+      for (const row of rows) {
+        const values = row as Record<string, unknown>;
+        const rowId = values["row_id"];
+        // The cursor advances from the raw column, not from parsed records:
+        // rows skipped as non-usage still prove the scan passed them. Rows
+        // committed mid-read land above the cursor and are picked up by a
+        // later chunk or the next scan, never missed.
+        if (typeof rowId === "number" && Number.isFinite(rowId) && rowId > cursor) {
+          cursor = rowId;
+          cursorMessageId = typeof values["id"] === "string" ? values["id"] : "";
+        }
+        const record = parseOpenCodeMessageRow({
+          id: values["id"],
+          session_id: values["session_id"],
+          time_created: values["time_created"],
+          data: values["data"],
+        });
+        if (record !== null) records.push(record);
       }
-      const record = parseOpenCodeMessageRow({
-        id: values["id"],
-        session_id: values["session_id"],
-        time_created: values["time_created"],
-        data: values["data"],
-      });
-      if (record !== null) records.push(record);
+      if (rows.length < MESSAGE_CHUNK_ROWS) break;
+      await yieldToEventLoop();
     }
-    return { records, maxRowTimeCreatedMs };
+
+    return {
+      records,
+      nextRowId: cursor,
+      nextMessageId: cursorMessageId,
+      openedVolumeId,
+      closingVolumeId: await readVolumeId(dbPath),
+    };
   } finally {
     try {
       db.close();
