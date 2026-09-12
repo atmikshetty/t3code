@@ -410,7 +410,13 @@ describe("scanOpenCodeDatabase", () => {
       const second = await scanOpenCodeDatabase(dbPath, state);
       expect(second.status).toBe("ok");
       if (second.status !== "ok") return;
-      expect(second.records.map((record) => record.dedupeKey)).toContain("msg_3");
+      const keys = second.records.map((record) => record.dedupeKey);
+      expect(keys).toContain("msg_3");
+      expect(keys).toContain("msg_1");
+      // The rewind re-read the whole table, so the deleted row must be gone.
+      // Merging into the old map instead would report it forever.
+      expect(keys).not.toContain("msg_2");
+      expect(state.records.has("msg_2")).toBe(false);
       expect(state.highWaterRowId).toBe(2);
     });
   });
@@ -644,6 +650,36 @@ describe("scanOpenCodeDatabase", () => {
       const outcome = await scanOpenCodeDatabase(NodePath.join(dir, "absent.db"), state);
       expect(outcome.status).toBe("missing");
       expect(state.hasRead).toBe(false);
+    });
+  });
+
+  it("reports an unreadable database as failed rather than missing", async () => {
+    // "Missing" tells the user there is no history here. A database that
+    // exists but cannot be read is the opposite situation, and reporting it
+    // as absent would hide a recoverable problem behind a reassuring message.
+    await withTempDir(async (dir) => {
+      const dbPath = NodePath.join(dir, "opencode.db");
+      const db = await createOpenCodeDatabase(dbPath);
+      insertMessage(db, "msg_1", "ses_1", 1000, assistantPayload());
+      db.close();
+      // A directory the process cannot traverse makes stat fail with EACCES
+      // rather than ENOENT.
+      const locked = NodePath.join(dir, "locked");
+      await NodeFSP.mkdir(locked);
+      const hidden = NodePath.join(locked, "opencode.db");
+      await NodeFSP.rename(dbPath, hidden);
+      await NodeFSP.chmod(locked, 0o000);
+      try {
+        const state = createOpenCodeScanState();
+        const outcome = await scanOpenCodeDatabase(hidden, state);
+        expect(outcome.status).toBe("failed");
+        if (outcome.status !== "failed") return;
+        expect(outcome.detail.length).toBeGreaterThan(0);
+        expect(state.hasRead).toBe(false);
+      } finally {
+        // Restore access so the temp dir can be cleaned up.
+        await NodeFSP.chmod(locked, 0o700);
+      }
     });
   });
 

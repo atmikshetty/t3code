@@ -293,16 +293,42 @@ export interface OpenCodeScanOptions {
   readonly retentionCutoffMs?: number;
 }
 
+/** True for the one stat failure that means "there is simply no file here". */
+function isNotFound(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { code?: unknown }).code === "ENOENT"
+  );
+}
+
+/**
+ * Absent file, or the reason it could not be read.
+ *
+ * An unreadable database is not the same as an absent one: reporting a
+ * permission or I/O failure as "no database" would tell the user nothing is
+ * there when in fact their history exists and is unreachable.
+ */
 async function statOrNull(path: string): Promise<NodeFS.Stats | null> {
   try {
     return await NodeFSP.stat(path);
+  } catch (error) {
+    if (isNotFound(error)) return null;
+    throw error;
+  }
+}
+
+/** Stat that treats every failure as absent, for probes where that is right. */
+async function statOrAbsent(path: string): Promise<NodeFS.Stats | null> {
+  try {
+    return await statOrNull(path);
   } catch {
     return null;
   }
 }
 
 async function readVolumeId(path: string): Promise<string> {
-  const stats = await statOrNull(path);
+  const stats = await statOrAbsent(path);
   return stats === null ? "" : `${stats.dev}:${stats.ino}`;
 }
 
@@ -327,7 +353,7 @@ export async function scanOpenCodeDatabase(
       const stats = await statOrNull(dbPath);
       if (stats === null) return { status: "missing", volumeId: "" };
       volumeId = `${stats.dev}:${stats.ino}`;
-      const wal = await statOrNull(`${dbPath}${WAL_SUFFIX}`);
+      const wal = await statOrAbsent(`${dbPath}${WAL_SUFFIX}`);
       const walSize = wal === null ? -1 : wal.size;
       const walMtimeMs = wal === null ? -1 : wal.mtimeMs;
 
@@ -370,6 +396,10 @@ export async function scanOpenCodeDatabase(
         };
       }
 
+      // A rewind re-read the whole table, so what it returns is the complete
+      // truth. Keeping the old map would preserve rows that have since been
+      // deleted, which is what forced the rewind in the first place.
+      if (read.resetFromBeginning) state.records.clear();
       for (const record of read.records) {
         // parseOpenCodeMessageRow only emits records that carry the message id
         // as their dedupe key, so this merge is idempotent.
@@ -464,6 +494,12 @@ function yieldToEventLoop(): Promise<void> {
 
 interface OpenCodeRead {
   readonly records: readonly UsageRecord[];
+  /**
+   * True when the cursor was rewound and the whole table was re-read. The
+   * caller must drop its cached records first: a rewind happens because rows
+   * were deleted, and a merge alone would keep reporting them forever.
+   */
+  readonly resetFromBeginning: boolean;
   /** Cursor for the next scan: the highest rowid this read reached. */
   readonly nextRowId: number;
   /** Message id sitting at `nextRowId`, so the next scan can trust it. */
@@ -496,9 +532,11 @@ async function readOpenCodeMessageRows(
     // largest one, so the cursor can come to rest on a row that is gone or on
     // a different message, with unread rows above it. Reading from scratch
     // after a tail deletion is cheap next to losing those rows.
+    let resetFromBeginning = false;
     if (cursor > 0 && cursorMessageId.length > 0 && db.messageIdAt(cursor) !== cursorMessageId) {
       cursor = 0;
       cursorMessageId = "";
+      resetFromBeginning = true;
     }
 
     const records: UsageRecord[] = [];
@@ -529,6 +567,7 @@ async function readOpenCodeMessageRows(
 
     return {
       records,
+      resetFromBeginning,
       nextRowId: cursor,
       nextMessageId: cursorMessageId,
       openedVolumeId,
