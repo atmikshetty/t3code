@@ -2068,11 +2068,17 @@ function summarizeImportFailure(error: string | null): string {
  */
 function AgentHistoryImportNowRow({
   environmentId,
+  isEnvironmentScope,
 }: {
   readonly environmentId: EnvironmentId | null;
+  readonly isEnvironmentScope: boolean;
 }) {
+  // The scope only names a representative environment, so a selection
+  // covering several would import from one of them and read as if it had
+  // covered all. Offer the action only when the scope is a single machine.
+  const target = isEnvironmentScope ? environmentId : null;
   const statusQuery = useEnvironmentQuery(
-    environmentId === null ? null : agentSessionImportStatus({ environmentId, input: {} }),
+    target === null ? null : agentSessionImportStatus({ environmentId: target, input: {} }),
   );
   const importAll = useAtomCommand(agentSessionImportAll, { reportFailure: false });
   const status = statusQuery.data;
@@ -2099,6 +2105,8 @@ function AgentHistoryImportNowRow({
     // lines. A settings row gets the first line only; the full cause is in the
     // server log.
     description = summarizeImportFailure(status.error);
+  } else if (target === null) {
+    description = "Select a single computer to import its conversations.";
   } else {
     description = "Bring existing conversations in now.";
   }
@@ -2110,11 +2118,11 @@ function AgentHistoryImportNowRow({
       control={
         <Button
           size="sm"
-          disabled={environmentId === null || isImporting}
+          disabled={target === null || isImporting}
           onClick={() => {
-            if (environmentId === null) return;
+            if (target === null) return;
             void (async () => {
-              const result = await importAll({ environmentId, input: {} });
+              const result = await importAll({ environmentId: target, input: {} });
               // The status stream only carries failures the importer itself
               // reached, so a request that never got there needs its own error.
               if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
@@ -2414,7 +2422,10 @@ export function GeneralSettingsPanel() {
           }
         />
 
-        <AgentHistoryImportNowRow environmentId={environmentId} />
+        <AgentHistoryImportNowRow
+          environmentId={environmentId}
+          isEnvironmentScope={isEnvironmentScope}
+        />
       </SettingsSection>
 
       <SettingsSection id="behavior" title="Behavior">
